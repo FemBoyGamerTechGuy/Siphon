@@ -1,0 +1,13 @@
+# build artifacts
+build/
+*.o
+*.a
+*.so
+
+# local test models (never commit weights)
+*.gguf
+tests/models/
+
+# editor / OS noise
+*.swp
+.DS_Store
