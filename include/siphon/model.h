@@ -2,10 +2,11 @@
  *
  * Loads hyperparameters, weights (zero-copy tensor views into the
  * mmap) and per-layer backend assignment for the llama and qwen2
- * architectures — the two graphs Milestone 2 executes. Norm weights
- * and biases are materialized as F32 at load (they are F32 in real
- * quantized files; F16 ones are widened losslessly), so the forward
- * pass never branches on their storage.
+ * architectures — the two graphs Milestone 2 executes. Every weight,
+ * including 1-D norm/bias vectors, is a view into the mmap: nothing is
+ * copied to the heap at load. The engine materializes non-F32 views
+ * into activation scratch on use (deterministic, so results are
+ * bit-identical to materializing once at load).
  */
 #ifndef SIPHON_MODEL_H
 #define SIPHON_MODEL_H
@@ -37,13 +38,23 @@ typedef struct {
     uint32_t n_head_gqa;     /* n_head / n_head_kv */
 } si_hparams;
 
+/* A small 1-D weight (norm/bias) kept zero-copy as a view into the
+ * mmap'd GGUF. data == NULL means the tensor is absent in the file.
+ * F32 views are consumed directly; other types are dequantized into
+ * engine scratch on use. */
+typedef struct {
+    const void *data;   /* mmap pointer (NULL if absent) */
+    uint32_t type;      /* ggml type id (SI_T_*) */
+    uint64_t n;         /* element count */
+} si_wview;
+
 typedef struct {
     si_tensor wq, wk, wv, wo;
     si_tensor w_gate, w_up, w_down;
-    /* F32 materialized at load (NULL when absent) */
-    float *attn_norm_f32;    /* [n_embd] */
-    float *ffn_norm_f32;     /* [n_embd] */
-    float *bq, *bk, *bv;     /* biases, [n_out] each (qwen2) */
+    /* zero-copy views (data == NULL when absent) */
+    si_wview attn_norm;      /* [n_embd] */
+    si_wview ffn_norm;       /* [n_embd] */
+    si_wview bq, bk, bv;     /* biases, [n_out] each (qwen2) */
 } si_layer;
 
 typedef struct {
@@ -52,7 +63,7 @@ typedef struct {
     si_arch arch;
     si_tensor tok_embd;      /* [n_embd, n_vocab] */
     si_layer *layers;
-    float *out_norm_f32;     /* [n_embd] */
+    si_wview out_norm;       /* [n_embd] */
     si_tensor output;        /* [n_embd, n_vocab]; aliases tok_embd if tied */
     bool output_tied;
     /* per-layer backend assignment (all CPU in milestone 2) */

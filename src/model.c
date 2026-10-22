@@ -13,16 +13,14 @@ static int find_tensor(si_gguf *g, const char *name, si_tensor *out) {
     return si_tensor_from_gguf(g, t, si_backend_cpu(), out);
 }
 
-/* materialize a small 1-D tensor (norm/bias) as F32; NULL if absent */
-static float *dup_row_f32(si_gguf *g, const char *name, uint64_t n) {
+/* build a zero-copy view over a small 1-D tensor (norm/bias); the
+ * view is absent (data == NULL) if the tensor is not in the file */
+static void find_wview(si_gguf *g, const char *name, uint64_t n,
+                        si_wview *out) {
     const si_gguf_tensor *t = si_gguf_tensor_find(g, name);
-    if (!t) return NULL;
-    float *buf = si_xmalloc((size_t)n * sizeof(float));
-    if (!si_dequant_row(t->ggml_type, t->data, buf, (int)n)) {
-        free(buf);
-        return NULL;
-    }
-    return buf;
+    out->data = t ? t->data : NULL;
+    out->type = t ? t->ggml_type : 0;
+    out->n = n;
 }
 
 int si_model_load(const char *path, si_model **outp) {
@@ -107,8 +105,8 @@ int si_model_load(const char *path, si_model **outp) {
     m->layers = si_xcalloc(h->n_layer, sizeof *m->layers);
     m->layer_be = si_xcalloc(h->n_layer, sizeof *m->layer_be);
 
-    m->out_norm_f32 = dup_row_f32(g, "output_norm.weight", h->n_embd);
-    if (!m->out_norm_f32) {
+    find_wview(g, "output_norm.weight", h->n_embd, &m->out_norm);
+    if (!m->out_norm.data) {
         si_set_err("missing output_norm.weight");
         si_model_free(m);
         return SI_ENOENT;
@@ -119,15 +117,15 @@ int si_model_load(const char *path, si_model **outp) {
         char name[128];
 
         snprintf(name, sizeof name, "blk.%u.attn_norm.weight", il);
-        l->attn_norm_f32 = dup_row_f32(g, name, h->n_embd);
-        if (!l->attn_norm_f32) {
+        find_wview(g, name, h->n_embd, &l->attn_norm);
+        if (!l->attn_norm.data) {
             si_set_err("missing %s", name);
             si_model_free(m);
             return SI_ENOENT;
         }
         snprintf(name, sizeof name, "blk.%u.ffn_norm.weight", il);
-        l->ffn_norm_f32 = dup_row_f32(g, name, h->n_embd);
-        if (!l->ffn_norm_f32) {
+        find_wview(g, name, h->n_embd, &l->ffn_norm);
+        if (!l->ffn_norm.data) {
             si_set_err("missing %s", name);
             si_model_free(m);
             return SI_ENOENT;
@@ -147,11 +145,11 @@ int si_model_load(const char *path, si_model **outp) {
         if (rc != SI_OK) { si_model_free(m); return rc; }
 
         snprintf(name, sizeof name, "blk.%u.attn_q.bias", il);
-        l->bq = dup_row_f32(g, name, l->wq.ne[0]);
+        find_wview(g, name, l->wq.ne[0], &l->bq);
         snprintf(name, sizeof name, "blk.%u.attn_k.bias", il);
-        l->bk = dup_row_f32(g, name, l->wk.ne[0]);
+        find_wview(g, name, l->wk.ne[0], &l->bk);
         snprintf(name, sizeof name, "blk.%u.attn_v.bias", il);
-        l->bv = dup_row_f32(g, name, l->wv.ne[0]);
+        find_wview(g, name, l->wv.ne[0], &l->bv);
 
         snprintf(name, sizeof name, "blk.%u.ffn_gate.weight", il);
         rc = find_tensor(g, name, &l->w_gate);
@@ -172,18 +170,8 @@ int si_model_load(const char *path, si_model **outp) {
 
 void si_model_free(si_model *m) {
     if (!m) return;
-    if (m->layers) {
-        for (uint32_t il = 0; il < m->h.n_layer; il++) {
-            free(m->layers[il].attn_norm_f32);
-            free(m->layers[il].bq);
-            free(m->layers[il].bk);
-            free(m->layers[il].bv);
-            free(m->layers[il].ffn_norm_f32);
-        }
-        free(m->layers);
-    }
+    free(m->layers);
     free(m->layer_be);
-    free(m->out_norm_f32);
     si_gguf_close(m->g);
     free(m);
 }

@@ -205,6 +205,7 @@ int si_engine_create(si_model *m, int64_t n_ctx, int n_threads,
     e->probs  = si_xmalloc((size_t)lanes * (size_t)n_ctx * sizeof(float));
     e->q16 = si_xmalloc(h->n_embd * sizeof(si_f16));
     e->probs16 = si_xmalloc((size_t)lanes * (size_t)n_ctx * sizeof(si_f16));
+    e->wscratch = si_xmalloc(h->n_embd * sizeof(float));
 
     *outp = e;
     return SI_OK;
@@ -227,7 +228,26 @@ void si_engine_free(si_engine *e) {
     free(e->rope_cos); free(e->rope_sin);
     free(e->scores); free(e->probs);
     free(e->q16); free(e->probs16);
+    free(e->wscratch);
     free(e);
+}
+
+/* ---- zero-copy weight materialization ----------------------------------- */
+
+/* Materialize a norm/bias view for this step: F32 views pass straight
+ * through the mmap pointer, everything else dequantizes into engine
+ * scratch (deterministic, bit-identical to materializing at load).
+ * All uses are sequential in the forward pass, so one buffer is safe.
+ * Returns NULL with si_err set on an unsupported type. */
+static const float *wv_f32(si_engine *e, const si_wview *v) {
+    if (!v->data) return NULL;
+    if (v->type == SI_T_F32) return (const float *)v->data;
+    if (!si_dequant_row(v->type, v->data, e->wscratch, (int)v->n)) {
+        si_set_err("norm/bias type %s unsupported",
+                   si_quant_name(v->type));
+        return NULL;
+    }
+    return e->wscratch;
 }
 
 /* ---- forward -------------------------------------------------------------- */
@@ -257,19 +277,27 @@ const float *si_engine_forward(si_engine *e, uint32_t token) {
         si_backend *be = m->layer_be[il];
 
         /* attention block */
-        rms_norm_mul(e->xb, e->x, l->attn_norm_f32, n_embd, h->rms_eps);
+        const float *attn_w = wv_f32(e, &l->attn_norm);
+        if (!attn_w) return NULL;
+        rms_norm_mul(e->xb, e->x, attn_w, n_embd, h->rms_eps);
 
         be->gemv(be, &l->wq, e->xb, e->q, (int64_t)h->n_embd, e->tp);
         be->gemv(be, &l->wk, e->xb, e->k, (int64_t)(n_head_kv * hd), e->tp);
         be->gemv(be, &l->wv, e->xb, e->v, (int64_t)(n_head_kv * hd), e->tp);
-        if (l->bq) {
-            for (int i = 0; i < n_embd; i++) e->q[i] = e->q[i] + l->bq[i];
+        if (l->bq.data) {
+            const float *b = wv_f32(e, &l->bq);
+            if (!b) return NULL;
+            for (int i = 0; i < n_embd; i++) e->q[i] = e->q[i] + b[i];
         }
-        if (l->bk) {
-            for (int i = 0; i < n_head_kv * hd; i++) e->k[i] = e->k[i] + l->bk[i];
+        if (l->bk.data) {
+            const float *b = wv_f32(e, &l->bk);
+            if (!b) return NULL;
+            for (int i = 0; i < n_head_kv * hd; i++) e->k[i] = e->k[i] + b[i];
         }
-        if (l->bv) {
-            for (int i = 0; i < n_head_kv * hd; i++) e->v[i] = e->v[i] + l->bv[i];
+        if (l->bv.data) {
+            const float *b = wv_f32(e, &l->bv);
+            if (!b) return NULL;
+            for (int i = 0; i < n_head_kv * hd; i++) e->v[i] = e->v[i] + b[i];
         }
 
         /* rope on every head of q and k */
@@ -308,7 +336,9 @@ const float *si_engine_forward(si_engine *e, uint32_t token) {
         for (int i = 0; i < n_embd; i++) e->x[i] = e->x[i] + e->ffbuf[i];
 
         /* ffn block */
-        rms_norm_mul(e->xb, e->x, l->ffn_norm_f32, n_embd, h->rms_eps);
+        const float *ffn_w = wv_f32(e, &l->ffn_norm);
+        if (!ffn_w) return NULL;
+        rms_norm_mul(e->xb, e->x, ffn_w, n_embd, h->rms_eps);
         be->gemv(be, &l->w_gate, e->xb, e->gate, (int64_t)h->n_ff, e->tp);
         be->gemv(be, &l->w_up, e->xb, e->up, (int64_t)h->n_ff, e->tp);
         swiglu_row(e->gate, e->gate, e->up, (int)h->n_ff);
@@ -321,7 +351,9 @@ const float *si_engine_forward(si_engine *e, uint32_t token) {
     }
 
     /* final norm + head */
-    rms_norm_mul(e->xb, e->x, m->out_norm_f32, n_embd, h->rms_eps);
+    const float *out_w = wv_f32(e, &m->out_norm);
+    if (!out_w) return NULL;
+    rms_norm_mul(e->xb, e->x, out_w, n_embd, h->rms_eps);
     if (e->layer_cb) {
         e->layer_cb(e, (int)h->n_layer, e->xb);
     }

@@ -60,6 +60,7 @@ typedef struct si_engine {
     float *probs;              /* [n_ctx] */
     si_f16 *q16;               /* [n_embd_q] */
     si_f16 *probs16;           /* [n_ctx] */
+    float *wscratch;           /* [n_embd] norm/bias view materialization */
 
     float theta_scale;         /* powf(freq_base, -2/n_rot) */
     float kq_scale;

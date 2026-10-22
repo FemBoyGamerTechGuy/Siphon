@@ -88,6 +88,26 @@ static double now_sec(void) {
     return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+/* peak process memory (Linux /proc; soft-fail elsewhere) */
+static void print_mem_peak(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[128];
+    long hwm_kb = -1, rss_kb = -1;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "VmHWM:", 6) == 0) {
+            sscanf(line + 6, "%ld", &hwm_kb);
+        } else if (strncmp(line, "VmRSS:", 6) == 0) {
+            sscanf(line + 6, "%ld", &rss_kb);
+        }
+    }
+    fclose(f);
+    if (hwm_kb > 0) {
+        printf("memory: peak %.1f MiB (VmHWM), current %.1f MiB (VmRSS)\n",
+               hwm_kb / 1024.0, rss_kb > 0 ? rss_kb / 1024.0 : 0.0);
+    }
+}
+
 static int read_file(const char *path, char **out, size_t *len) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -212,6 +232,7 @@ static int cmd_run_golden(si_engine *eng, const char *path) {
     const bool pass = pre_max <= thr && real_flips == 0;
     printf("result: %s (prefill max %.4f vs threshold %.2f)\n",
            pass ? "PASS" : "FAIL", pre_max, thr);
+    print_mem_peak();
 
     free(toks);
     free(ref);
@@ -289,6 +310,7 @@ static int cmd_run_generate(si_engine *eng, si_vocab *voc, const char *prompt,
            t_decode, n_out - n_ids,
            (n_out - n_ids) / (t_decode > 0 ? t_decode : 1e-9),
            si_kern_impl_name(), si_tp_nlanes(eng->tp));
+    print_mem_peak();
 
     if (dump_path) {
         rc = slgd_write(dump_path, seq, all_logits, (uint32_t)n_out,
