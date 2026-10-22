@@ -74,20 +74,23 @@ $(OBJ_DIR)/test-%: tests/%.c $(TEST_OBJS) | $(OBJ_DIR)
 # llama.cpp build (AVX2-only kernels, FA off, single thread). PASS
 # requires prefill max |logit diff| within the calibrated band and
 # zero real argmax flips in the first 24 positions.
-GOLDEN_DIR ?= /tmp/my-project/ref/golden
-MODELS_DIR ?= /tmp/my-project/models
-GOLDENS := tinyllama-france tinyllama-story tinyllama-code \
-           qwen-france qwen-story qwen-code
+GOLDEN_DIR ?= /home/z/my-project/ref/golden
+MODELS_DIR ?= /home/z/my-project/models
+PROMPTS := france story code science scifi letter
+GOLDENS := $(foreach p,$(PROMPTS),qwen05-q4km-$(p) qwen05-q8-$(p) \
+           llama32-q4km-$(p) llama32-q8-$(p))
 
 .PHONY: check-infer
 check-infer: $(BIN)
 	@fail=0; \
 	for g in $(GOLDENS); do \
-	if [ "$${g#tinyllama}" != "$$g" ]; then \
-	m=$(MODELS_DIR)/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf; \
-                else \
-	m=$(MODELS_DIR)/qwen2.5-0.5b-instruct-q4_k_m.gguf; \
-	fi; \
+	case "$$g" in \
+	qwen05-q4km*) m=$(MODELS_DIR)/qwen2.5-0.5b-instruct-q4_k_m.gguf;; \
+	qwen05-q8*)   m=$(MODELS_DIR)/qwen2.5-0.5b-instruct-q8_0.gguf;; \
+	llama32-q4km*) m=$(MODELS_DIR)/llama-3.2-1b-instruct-q4_k_m.gguf;; \
+	llama32-q8*)   m=$(MODELS_DIR)/llama-3.2-1b-instruct-q8_0.gguf;; \
+	*) echo "unknown golden tag: $$g"; fail=1; continue;; \
+	esac; \
 	echo "== $$g"; \
 	if [ ! -f "$(GOLDEN_DIR)/$$g.slgd" ]; then \
 	echo "  SKIP (no golden at $(GOLDEN_DIR)/$$g.slgd)"; \

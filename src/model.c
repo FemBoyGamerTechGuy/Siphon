@@ -112,6 +112,13 @@ int si_model_load(const char *path, si_model **outp) {
         return SI_ENOENT;
     }
 
+    /* optional per-dim rope frequency factors (rope_freqs.weight):
+     * llama3-style conversions bake the low/high frequency correction
+     * into the file as [n_rot/2] factors; the engine divides each
+     * pair's angle by them exactly like the reference (theta/ff on the
+     * accumulated angle). Absent in llama1/2, qwen, mistral files. */
+    find_wview(g, "rope_freqs.weight", h->n_rot / 2, &m->rope_ffs);
+
     for (uint32_t il = 0; il < h->n_layer; il++) {
         si_layer *l = &m->layers[il];
         char name[128];

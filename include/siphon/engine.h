@@ -61,6 +61,8 @@ typedef struct si_engine {
     si_f16 *q16;               /* [n_embd_q] */
     si_f16 *probs16;           /* [n_ctx] */
     float *wscratch;           /* [n_embd] norm/bias view materialization */
+    const float *rope_ff;      /* [n_rot/2] rope freq factors (NULL: none) */
+    float *rope_ff_buf;        /* owned buffer when the tensor is not F32 */
 
     float theta_scale;         /* powf(freq_base, -2/n_rot) */
     float kq_scale;

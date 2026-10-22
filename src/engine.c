@@ -3,6 +3,7 @@
 #include "siphon/kernels.h"
 
 #include <math.h>
+#include <stdio.h>
 
 static si_vec_dot_fn g_dot_f16;
 
@@ -26,8 +27,14 @@ static void rope_table(si_engine *e, int64_t pos) {
     float theta = (float)pos;
     const int np = (int)e->m->h.n_rot / 2;
     for (int j = 0; j < np; j++) {
-        e->rope_cos[j] = cosf(theta);
-        e->rope_sin[j] = sinf(theta);
+        /* rope_freqs models (llama3-style conversions): the reference
+         * divides the accumulated angle by the per-pair factor before
+         * the trig call — theta/ff, then theta *= scale (no compounding
+         * of the division). With no factors this is the plain table. */
+        float th = theta;
+        if (e->rope_ff) th = th / e->rope_ff[j];
+        e->rope_cos[j] = cosf(th);
+        e->rope_sin[j] = sinf(th);
         theta *= e->theta_scale;
     }
 }
@@ -42,10 +49,17 @@ static void rope_apply(si_engine *e, float *v, int head_dim) {
             const float x1 = v[2 * j + 1];
             const float cs = e->rope_cos[j];
             const float sn = e->rope_sin[j];
-            v[2 * j + 0] = x0 * cs - x1 * sn;
-            v[2 * j + 1] = x0 * sn + x1 * cs;
+            /* the reference's AVX2 build contracts the interleaved-path
+             * rotation into fma(x0, c, -(x1*s)): the second product
+             * rounds once, then one fused multiply-add. fmaf() is a
+             * single correctly-rounded operation regardless of how this
+             * translation unit is compiled, so the bits match the
+             * reference exactly. */
+            v[2 * j + 0] = fmaf(x0, cs, -(x1 * sn));
+            v[2 * j + 1] = fmaf(x0, sn, x1 * cs);
         }
-    } else { /* NEOX */
+    } else { /* NEOX: the reference's strided path stays unvectorized and
+              * uncontracted — plain products and sum, bit for bit. */
         const int half = head_dim / 2;
         for (int j = 0; j < np; j++) {
             const float x0 = v[j];
@@ -207,6 +221,24 @@ int si_engine_create(si_model *m, int64_t n_ctx, int n_threads,
     e->probs16 = si_xmalloc((size_t)lanes * (size_t)n_ctx * sizeof(si_f16));
     e->wscratch = si_xmalloc(h->n_embd * sizeof(float));
 
+    /* rope frequency factors: F32 views pass straight through the mmap;
+     * anything else materializes once into an owned buffer */
+    if (m->rope_ffs.data) {
+        if (m->rope_ffs.type == SI_T_F32) {
+            e->rope_ff = (const float *)m->rope_ffs.data;
+        } else {
+            e->rope_ff_buf = si_xmalloc((size_t)(h->n_rot / 2) * sizeof(float));
+            if (!si_dequant_row(m->rope_ffs.type, m->rope_ffs.data,
+                                e->rope_ff_buf, (int)(h->n_rot / 2))) {
+                si_set_err("rope_freqs type %s unsupported",
+                           si_quant_name(m->rope_ffs.type));
+                si_engine_free(e);
+                return SI_ENOTSUP;
+            }
+            e->rope_ff = e->rope_ff_buf;
+        }
+    }
+
     *outp = e;
     return SI_OK;
 }
@@ -229,6 +261,7 @@ void si_engine_free(si_engine *e) {
     free(e->scores); free(e->probs);
     free(e->q16); free(e->probs16);
     free(e->wscratch);
+    free(e->rope_ff_buf);
     free(e);
 }
 

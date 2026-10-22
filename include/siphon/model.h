@@ -64,6 +64,7 @@ typedef struct {
     si_tensor tok_embd;      /* [n_embd, n_vocab] */
     si_layer *layers;
     si_wview out_norm;       /* [n_embd] */
+    si_wview rope_ffs;       /* [n_rot/2] optional rope frequency factors */
     si_tensor output;        /* [n_embd, n_vocab]; aliases tok_embd if tied */
     bool output_tied;
     /* per-layer backend assignment (all CPU in milestone 2) */
