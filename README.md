@@ -116,13 +116,16 @@ Hard rules the project holds itself to:
   weight type's dot-pair format — the same work-buffer semantics as the
   reference.
 - **Model loader** for the llama and qwen2 graphs: hyperparameters,
-  zero-copy weight views, GQA, tied or separate output heads, q/k/v
-  biases (Qwen), F32-materialized norms.
+  zero-copy weight views (matmul tensors and 1-D norm/bias vectors
+  alike — nothing is copied to the heap at load), GQA, tied or separate
+  output heads, q/k/v biases (Qwen), optional llama3 rope frequency
+  factors.
 - **Engine**: token-serial decode; K cache position-major and V cache
   transposed (channel-major), both f16, so both attention contractions go
   through the standard f16 dot exactly like the reference's classic
   (non-flash) path; rope NORM (llama) and NEOX (qwen2) with
-  successive-multiply angle tables.
+  successive-multiply angle tables, per-pair frequency factors when the
+  file carries them, and the reference's exact FMA contraction pattern.
 - **Sampler**: greedy (first argmax, the reference's tie rule),
   temperature/top-k/top-p with a seeded xorshift64* RNG.
 - **`siphon run`**: generation with timing, `--dump-logits` (writes the
@@ -138,25 +141,52 @@ Hard rules the project holds itself to:
   and 101,340 threadpool checks (lane invariance, rapid dispatch,
   per-lane scratch isolation, spin-then-park stress), plus the milestone-1
   suites (103 parser + 69 synthetic + 276 fixture cases).
-- **`make check-infer`: 6/6 golden comparisons PASS** (TinyLlama-1.1B and
-  Qwen2.5-0.5B, Q4_K_M, prompts: france/story/code × 32 generated
-  tokens). Goldens are token-serial logits dumps from a dev-time llama.cpp
-  reference build pinned to the same AVX2 kernel set. Teacher-forced
-  positions 0–1 reproduce the reference **bit-exactly**; beyond that a
-  single q8_K rounding boundary diverges and amplifies chaotically —
-  the reference's own FA-on vs FA-off paths vary by more (31 logits / 27
-  argmax flips on the same run), which calibrates the acceptance band:
-  prefill max |logit diff| ≤ 0.6 (short) / ≤ 1.0 (medium), zero real
-  argmax flips (reference top-2 gap > 1.0) in the first 24 positions.
-  Observed: 0.42/0.51/0.74 (TinyLlama), 0.00/0.61/0.91 (Qwen — the
-  france prefill is fully bit-exact), 0 real flips everywhere.
-- Decode throughput (2 vCPU sandbox): TinyLlama-1.1B Q4_K_M **~10.3 tok/s**
-  (`-t 1`) / ~9.5 tok/s (`-t 2`); Qwen2.5-0.5B Q4_K_M ~9.5 tok/s. The second
-  lane buys nothing at this model size on the sandbox's shared vCPUs (the
-  per-call dispatch overhead of ~160 small parallel sections per token
-  offsets it); the meaningful property is that `-t 1` and `-t 2` produce
-  **byte-identical logits**. Batching (milestone 4) is where the threads
-  pay off.
+- **`make check-infer`: 24/24 golden comparisons PASS** — the full
+  matrix: 2 architectures (Qwen2.5-0.5B, Llama-3.2-1B) × 2 quants
+  (Q4_K_M, Q8_0) × 6 prompts (france/story/code/science/scifi/letter)
+  × **64 generated tokens each**. Goldens are token-serial logits dumps
+  from a dev-time llama.cpp reference build pinned to the AVX2 kernel
+  set (GGML_NATIVE=OFF, AVX2+FMA+F16C, FA disabled, 1 thread).
+  **11 of 24 prefill comparisons are fully bit-exact (0.0000)**,
+  including every pure-Q8_0 llama run and most Q4_K_M qwen runs;
+  positions 0–1 are bit-exact on every model and quant (proven
+  layer-by-layer: all 16 layers + final norm + logits at position 1
+  match to the last bit on both llama files). Beyond that, single
+  q8_K/f16 rounding boundaries diverge and amplify chaotically —
+  the reference's own FA-on vs FA-off paths vary by more on the same
+  prompts (measured on llama32-q4km-letter: reference self-variation
+  prefill max 0.82 / mean 0.47 with 21 argmax flips, vs Siphon's worst
+  0.64 / 0.05 with 2 near-tie flips), which calibrates the acceptance
+  band: prefill max |logit diff| ≤ 0.6 (≤ 8 prompt tokens) / ≤ 1.0
+  (longer), zero real argmax flips (reference top-2 gap > 1.0) in the
+  first 24 positions. Observed worst-case prefill max: 0.44–0.64
+  (llama Q4_K_M), 0.22–0.37 (llama Q8_0), 0.00–0.54 (qwen both quants);
+  zero real flips anywhere; greedy streams stay aligned for 64+ tokens.
+- **rope frequency factors (llama3 rope scaling)**: GGUF conversions of
+  Llama-3.x models bake the low/high-frequency correction into a
+  `rope_freqs.weight` tensor ([n_rot/2] F32 factors); the engine divides
+  each pair's accumulated angle by its factor exactly like the reference
+  (`theta/ff`, then `theta *= scale` — no compounding). Files without
+  the tensor (llama1/2, qwen, mistral) take the plain path. The
+  interleaved (NORM) rotation also replicates the reference build's FMA
+  contraction (`fmaf(x0, c, -(x1*s))`) — the strided (NEOX) path stays
+  scalar — which is what makes llama-family rope bit-exact.
+- Throughput, prefill and decode separately (2 vCPU sandbox, `-t 2`),
+  with peak process memory (VmHWM, includes the mmap'd weights +
+  KV cache + activations + tokenizer):
+
+  | model | file | prefill | decode | peak RAM |
+  |---|---|---|---|---|
+  | Qwen2.5-0.5B Q4_K_M | 469 MB | 9.9 tok/s | 10.1 tok/s | 433 MiB |
+  | Qwen2.5-0.5B Q8_0 | 645 MB | 9.0 tok/s | 9.1 tok/s | 561 MiB |
+  | Llama-3.2-1B Q4_K_M | 770 MB | 9.6 tok/s | 9.7 tok/s | 844 MiB |
+  | Llama-3.2-1B Q8_0 | 1260 MB | 3.6 tok/s | 3.5 tok/s | 1332 MiB |
+
+  Prefill is token-serial (one forward per prompt token), so prefill
+  and decode cost the same per token today; batching (milestone 4) is
+  where prefill accelerates and the threads pay off. `-t 1` runs
+  ~7.1 tok/s on llama-3.2 Q4_K_M (1.37× from the second lane on shared
+  vCPUs), and `-t 1` and `-t 2` produce **byte-identical logits**.
 
 ### Known limitations (milestone 2)
 
