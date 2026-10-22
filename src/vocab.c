@@ -14,10 +14,16 @@
 
 /* ---- arena ------------------------------------------------------------ */
 
+/* NOTE: arena_put must never realloc after the initial allocation —
+ * si_vocab_load pre-sizes the arena in a first pass precisely so all
+ * returned pointers stay valid (an early version realloc'd lazily and
+ * dangled every previously-stored token pointer). */
 static char *arena_put(si_vocab *v, const char *s, size_t n) {
     if (v->arena_len + n + 1 > v->arena_cap) {
+        /* should be impossible: loader pre-sizes exactly */
         v->arena_cap = (v->arena_len + n + 1) * 2 + 4096;
         v->arena = si_xrealloc(v->arena, v->arena_cap);
+        si_log_warn("vocab arena grew unexpectedly; token pointers moved");
     }
     char *p = v->arena + v->arena_len;
     memcpy(p, s, n);
@@ -161,6 +167,42 @@ int si_vocab_load(si_gguf *g, si_vocab **out) {
     si_map_init(str2id, v->n_tokens + 16);
     v->str2id = str2id;
 
+    /* merges (BPE): sizes needed before the arena can be allocated */
+    const si_gguf_kv *mk = NULL;
+    if (v->kind == SI_VOCAB_BPE) {
+        mk = si_gguf_find_arr(g, "tokenizer.ggml.merges");
+        if (!mk || mk->v.arr.elem != SI_GGUF_V_STRING) {
+            si_set_err("tokenizer.ggml.merges missing for gpt2 tokenizer");
+            goto fail;
+        }
+        v->n_merges = (uint32_t) mk->v.arr.count;
+    }
+
+    /* pass 1: exact arena size (tokens + merges + NULs) */
+    {
+        size_t need = 0;
+        for (uint32_t i = 0; i < v->n_tokens; i++) {
+            si_gguf_str t;
+            if (si_gguf_arr_str_get(g, "tokenizer.ggml.tokens", i, &t) != SI_OK) {
+                si_set_err("failed reading token %u", i);
+                goto fail;
+            }
+            need += t.len ? t.len + 1 : 16;  /* "[EMPTY_nnn]" worst case */
+        }
+        for (uint32_t i = 0; i < v->n_merges; i++) {
+            si_gguf_str m;
+            if (si_gguf_arr_str_get(g, "tokenizer.ggml.merges", i, &m) != SI_OK) {
+                si_set_err("failed reading merge %u", i);
+                goto fail;
+            }
+            need += m.len + 2;
+        }
+        v->arena = si_xmalloc(need + 4096);
+        v->arena_cap = need + 4096;
+        v->arena_len = 0;
+    }
+
+    /* pass 2: fill */
     for (uint32_t i = 0; i < v->n_tokens; i++) {
         si_gguf_str t;
         if (si_gguf_arr_str_get(g, "tokenizer.ggml.tokens", i, &t) != SI_OK) {
@@ -190,14 +232,8 @@ int si_vocab_load(si_gguf *g, si_vocab **out) {
         si_map_put(str2id, v->tok_text[i], v->tok_len[i], i, true);
     }
 
-    /* merges (BPE) */
+    /* merges (BPE): store split halves in the same arena */
     if (v->kind == SI_VOCAB_BPE) {
-        const si_gguf_kv *mk = si_gguf_find_arr(g, "tokenizer.ggml.merges");
-        if (!mk || mk->v.arr.elem != SI_GGUF_V_STRING) {
-            si_set_err("tokenizer.ggml.merges missing for gpt2 tokenizer");
-            goto fail;
-        }
-        v->n_merges = (uint32_t) mk->v.arr.count;
         v->merge_l = si_xcalloc(v->n_merges, sizeof(char *));
         v->merge_r = si_xcalloc(v->n_merges, sizeof(char *));
         v->merge_llen = si_xcalloc(v->n_merges, sizeof(uint32_t));
@@ -280,6 +316,33 @@ int si_vocab_load(si_gguf *g, si_vocab **out) {
             v->byte_tok[b] = s ? (int32_t) s->val : -1;
         }
         v->linefeed_id = v->byte_tok['\n'];
+    }
+
+    /* Token texts that the reference promotes to CONTROL (its EOG list:
+     * models like Qwen ship "</s>" as a plain normal token, but the
+     * reference partitions on it when parse_special is set). Empty-token
+     * entries never match because empty tokens were renamed above. */
+    {
+        static const char *const eog_texts[] = {
+            "<|eot_id|>", "<|eot|>", "<|im_end|>", "<|end|>", "<|return|>",
+            "<|call|>", "<|flush|>", "<|calls|>", "<end_of_turn>", "",
+            "<|end_of_text|>", "<EOT>", "_<EOT>", "[EOT]", "[EOS]",
+            "<eos>", "<turn|>", "<|tool_response>", "<|end_of_utterance>",
+            "</s>", "<|eom_id|>",
+            "<\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">",
+            "[e~[", "<|ifm|im_end|>",
+        };
+        for (uint32_t i = 0; i < v->n_tokens; i++) {
+            if (v->tok_type[i] == SI_TOK_CONTROL) continue;
+            for (size_t e = 0; e < sizeof(eog_texts) / sizeof(eog_texts[0]); e++) {
+                if (strcmp(v->tok_text[i], eog_texts[e]) == 0) {
+                    si_log_warn("token %u '%s' promoted to control (EOG heuristic)",
+                                i, v->tok_text[i]);
+                    v->tok_type[i] = SI_TOK_CONTROL;
+                    break;
+                }
+            }
+        }
     }
 
     /* special-token cache: CONTROL | USER | UNKNOWN, length desc */

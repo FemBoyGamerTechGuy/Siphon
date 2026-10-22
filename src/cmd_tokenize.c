@@ -7,6 +7,13 @@
  */
 #include "siphon/vocab.h"
 
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 static void print_escaped(const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char) s[i];
@@ -41,12 +48,14 @@ int cmd_tokenize(int argc, char **argv) {
     bool add_special = true;
     bool parse_special = false;
     bool detok = false;
+    bool hex_mode = false;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--ids") == 0) ids_only = true;
         else if (strcmp(argv[i], "--no-special") == 0) add_special = false;
         else if (strcmp(argv[i], "--parse-special") == 0) parse_special = true;
         else if (strcmp(argv[i], "--detok") == 0) detok = true;
+        else if (strcmp(argv[i], "--hex") == 0) hex_mode = true;
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) text_arg = argv[++i];
         else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             si_log_warn("unknown flag '%s' for tokenize", argv[i]);
@@ -59,6 +68,7 @@ int cmd_tokenize(int argc, char **argv) {
                         "  --ids            print ids only\n"
                         "  --no-special     don't add bos/eos\n"
                         "  --parse-special  parse special tokens in text\n"
+                        "  --hex            stdin is hex lines; output \"<hex> <ids...>\" per line\n"
                         "  --detok          decode ids (one per line / space separated) from stdin\n");
         return 1;
     }
@@ -73,6 +83,64 @@ int cmd_tokenize(int argc, char **argv) {
         si_log_err("%s", si_errstr());
         si_gguf_close(g);
         return 1;
+    }
+
+    /* hex mode: line-per-case machine-readable comparison format,
+     * mirroring the dev-time reference dumper exactly */
+    if (hex_mode) {
+        char line[65536];
+        int rc_hex = 0;
+        while (fgets(line, sizeof(line), stdin)) {
+            size_t ll = strlen(line);
+            while (ll > 0 && (line[ll - 1] == '\n' || line[ll - 1] == '\r')) line[--ll] = '\0';
+            if (ll == 0 || line[0] == '#') continue;
+
+            size_t clen = ll / 2;
+            char *text = si_xmalloc(clen ? clen : 1);
+            bool ok = true;
+            for (size_t i = 0; i < clen; i++) {
+                int hi = hexval(line[2 * i]);
+                int lo = hexval(line[2 * i + 1]);
+                if (hi < 0 || lo < 0) { ok = false; break; }
+                text[i] = (char)(hi * 16 + lo);
+            }
+            if (!ok) {
+                si_log_warn("bad hex line '%s'", line);
+                free(text);
+                rc_hex = 1;
+                continue;
+            }
+            uint32_t *ids = NULL;
+            size_t n_ids = 0;
+            if (si_tokenize(v, text, clen, add_special, parse_special,
+                            &ids, &n_ids) == SI_OK) {
+                printf("%s", line);
+                for (size_t i = 0; i < n_ids; i++) printf(" %u", ids[i]);
+                if (detok) {
+                    /* append detokenized bytes as hex after a "|" */
+                    char *back = NULL;
+                    size_t back_len = 0;
+                    if (si_detokenize(v, ids, n_ids, false, true,
+                                      &back, &back_len) == SI_OK) {
+                        printf(" |");
+                        for (size_t i = 0; i < back_len; i++) {
+                            printf("%02x", (unsigned char) back[i]);
+                        }
+                        free(back);
+                    } else {
+                        rc_hex = 1;
+                    }
+                }
+                printf("\n");
+                free(ids);
+            } else {
+                rc_hex = 1;
+            }
+            free(text);
+        }
+        si_vocab_free(v);
+        si_gguf_close(g);
+        return rc_hex;
     }
 
     int rc = 0;
@@ -132,20 +200,29 @@ int cmd_tokenize(int argc, char **argv) {
                     putchar('\n');
                 }
             }
-            /* roundtrip check */
+            /* roundtrip check: tokenize WITHOUT special tokens and decode
+             * back; must reproduce the input byte-for-byte unless the
+             * model's detokenizer applies the reference's clean_spaces
+             * normalization (gpt2-family), which is lossy by design. */
             char *back = NULL;
             size_t back_len = 0;
-            if (rc == 0 && si_detokenize(v, ids, n_ids, true, true, &back, &back_len) == SI_OK) {
+            uint32_t *ids_rt = NULL;
+            size_t n_rt = 0;
+            if (rc == 0 &&
+                si_tokenize(v, text, len, false, parse_special, &ids_rt, &n_rt) == SI_OK &&
+                si_detokenize(v, ids_rt, n_rt, false, true, &back, &back_len) == SI_OK) {
                 bool same = back_len == len && memcmp(back, text, len) == 0;
                 if (!ids_only) {
-                    printf("# roundtrip: %s (%zu -> %zu bytes)\n",
-                           same ? "ok" : "MISMATCH", len, back_len);
-                } else if (!same) {
+                    printf("# roundtrip (no-special): %s (%zu -> %zu bytes)%s\n",
+                           same ? "ok" : "MISMATCH", len, back_len,
+                           (!same && v->clean_spaces) ? " [clean_spaces normalization]" : "");
+                } else if (!same && !v->clean_spaces) {
                     fprintf(stderr, "siphon: roundtrip MISMATCH\n");
                     rc = 1;
                 }
                 free(back);
             }
+            free(ids_rt);
             free(ids);
         }
         free(text);
